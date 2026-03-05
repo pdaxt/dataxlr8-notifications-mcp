@@ -1,10 +1,88 @@
-use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_bool, get_i64, get_str, json_result, make_schema};
+use dataxlr8_mcp_core::mcp::{error_result, get_bool, get_i64, get_str, json_result, make_schema};
 use dataxlr8_mcp_core::Database;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const VALID_CHANNELS: &[&str] = &["email", "slack", "in_app"];
+const VALID_PRIORITIES: &[&str] = &["low", "normal", "high", "urgent"];
+const VALID_EVENT_TYPES: &[&str] = &["deal_moved", "task_overdue", "score_threshold"];
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 500;
+const DEFAULT_OFFSET: i64 = 0;
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// Extract a required string param, trimmed. Returns Err(CallToolResult) on missing/empty.
+fn require_str_trimmed(args: &serde_json::Value, key: &str) -> Result<String, CallToolResult> {
+    match get_str(args, key) {
+        Some(v) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                Err(error_result(&format!(
+                    "Parameter '{key}' must not be empty"
+                )))
+            } else {
+                Ok(trimmed)
+            }
+        }
+        None => Err(error_result(&format!(
+            "Missing required parameter: {key}"
+        ))),
+    }
+}
+
+/// Extract an optional string param, trimmed. Returns None for missing, Err for empty-after-trim.
+fn optional_str_trimmed(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<String>, CallToolResult> {
+    match get_str(args, key) {
+        Some(v) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                Err(error_result(&format!(
+                    "Parameter '{key}' must not be empty when provided"
+                )))
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Validate that a string value is in an allowed set.
+fn validate_enum(value: &str, allowed: &[&str], param_name: &str) -> Result<(), CallToolResult> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(error_result(&format!(
+            "Invalid {param_name}: '{value}'. Must be one of: {}",
+            allowed.join(", ")
+        )))
+    }
+}
+
+/// Extract and clamp limit/offset from args.
+fn pagination(args: &serde_json::Value) -> (i64, i64) {
+    let limit = get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1)
+        .min(MAX_LIMIT);
+    let offset = get_i64(args, "offset")
+        .unwrap_or(DEFAULT_OFFSET)
+        .max(0);
+    (limit, offset)
+}
 
 // ============================================================================
 // Data types
@@ -87,7 +165,8 @@ fn build_tools() -> Vec<Tool> {
                     "channel": { "type": "string", "enum": ["email", "slack", "in_app"], "description": "Filter by channel" },
                     "priority": { "type": "string", "enum": ["low", "normal", "high", "urgent"], "description": "Filter by priority" },
                     "read": { "type": "boolean", "description": "Filter by read status" },
-                    "limit": { "type": "integer", "description": "Max results (default 50)" }
+                    "limit": { "type": "integer", "description": "Max results (default 50, max 500)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -158,7 +237,9 @@ fn build_tools() -> Vec<Tool> {
             input_schema: make_schema(
                 serde_json::json!({
                     "event_type": { "type": "string", "enum": ["deal_moved", "task_overdue", "score_threshold"], "description": "Filter by event type" },
-                    "active": { "type": "boolean", "description": "Filter by active status" }
+                    "active": { "type": "boolean", "description": "Filter by active status" },
+                    "limit": { "type": "integer", "description": "Max results (default 50, max 500)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec![],
             ),
@@ -222,23 +303,37 @@ impl NotificationsMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_send_notification(&self, args: &serde_json::Value) -> CallToolResult {
-        let channel = match get_str(args, "channel") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: channel"),
+        let channel = match require_str_trimmed(args, "channel") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let recipient = match get_str(args, "recipient") {
-            Some(r) => r,
-            None => return error_result("Missing required parameter: recipient"),
+        if let Err(e) = validate_enum(&channel, VALID_CHANNELS, "channel") {
+            return e;
+        }
+
+        let recipient = match require_str_trimmed(args, "recipient") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let title = match get_str(args, "title") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: title"),
+        let title = match require_str_trimmed(args, "title") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let body = match get_str(args, "body") {
-            Some(b) => b,
-            None => return error_result("Missing required parameter: body"),
+        let body = match require_str_trimmed(args, "body") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let priority = get_str(args, "priority").unwrap_or_else(|| "normal".into());
+
+        let priority = match optional_str_trimmed(args, "priority") {
+            Ok(Some(v)) => {
+                if let Err(e) = validate_enum(&v, VALID_PRIORITIES, "priority") {
+                    return e;
+                }
+                v
+            }
+            Ok(None) => "normal".to_string(),
+            Err(e) => return e,
+        };
 
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -256,19 +351,41 @@ impl NotificationsMcpServer {
         .await
         {
             Ok(msg) => {
-                info!(id = id, channel = channel, recipient = recipient, "Sent notification");
+                info!(id = %id, channel = %channel, recipient = %recipient, "Sent notification");
                 json_result(&msg)
             }
-            Err(e) => error_result(&format!("Failed to send notification: {e}")),
+            Err(e) => {
+                error!(error = %e, channel = %channel, recipient = %recipient, "Failed to send notification");
+                error_result(&format!("Failed to send notification: {e}"))
+            }
         }
     }
 
     async fn handle_list_notifications(&self, args: &serde_json::Value) -> CallToolResult {
-        let recipient = get_str(args, "recipient");
-        let channel = get_str(args, "channel");
-        let priority = get_str(args, "priority");
+        let recipient = match optional_str_trimmed(args, "recipient") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let channel = match optional_str_trimmed(args, "channel") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Some(ref c) = channel {
+            if let Err(e) = validate_enum(c, VALID_CHANNELS, "channel") {
+                return e;
+            }
+        }
+        let priority = match optional_str_trimmed(args, "priority") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Some(ref p) = priority {
+            if let Err(e) = validate_enum(p, VALID_PRIORITIES, "priority") {
+                return e;
+            }
+        }
         let read = get_bool(args, "read");
-        let limit = get_i64(args, "limit").unwrap_or(50);
+        let (limit, offset) = pagination(args);
 
         let mut sql = String::from(
             "SELECT id, channel, recipient, title, body, priority, read, delivered, created_at \
@@ -299,7 +416,11 @@ impl NotificationsMcpServer {
             bool_param = Some(r);
         }
 
-        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${param_idx}"));
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1
+        ));
 
         let mut query = sqlx::query_as::<_, Message>(&sql);
         for p in &str_params {
@@ -309,10 +430,14 @@ impl NotificationsMcpServer {
             query = query.bind(r);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
             Ok(messages) => json_result(&messages),
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to list notifications");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -325,11 +450,14 @@ impl NotificationsMcpServer {
         .await
         {
             Ok(Some(msg)) => {
-                info!(id = id, "Marked notification as read");
+                info!(id = %id, "Marked notification as read");
                 json_result(&msg)
             }
             Ok(None) => error_result(&format!("Notification '{id}' not found")),
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, id = %id, "Failed to mark notification as read");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -343,29 +471,41 @@ impl NotificationsMcpServer {
         {
             Ok(r) => {
                 let count = r.rows_affected();
-                info!(recipient = recipient, count = count, "Marked all notifications as read");
+                info!(recipient = %recipient, count = count, "Marked all notifications as read");
                 json_result(&serde_json::json!({
                     "recipient": recipient,
                     "marked_read": count
                 }))
             }
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, recipient = %recipient, "Failed to mark all notifications as read");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
     async fn handle_create_rule(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = match get_str(args, "event_type") {
-            Some(e) => e,
-            None => return error_result("Missing required parameter: event_type"),
+        let event_type = match require_str_trimmed(args, "event_type") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let channel = match get_str(args, "channel") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: channel"),
+        if let Err(e) = validate_enum(&event_type, VALID_EVENT_TYPES, "event_type") {
+            return e;
+        }
+
+        let channel = match require_str_trimmed(args, "channel") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        let template = match get_str(args, "template") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: template"),
+        if let Err(e) = validate_enum(&channel, VALID_CHANNELS, "channel") {
+            return e;
+        }
+
+        let template = match require_str_trimmed(args, "template") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
+
         let condition = args
             .get("condition")
             .cloned()
@@ -386,16 +526,28 @@ impl NotificationsMcpServer {
         .await
         {
             Ok(rule) => {
-                info!(id = id, event_type = event_type, "Created notification rule");
+                info!(id = %id, event_type = %event_type, "Created notification rule");
                 json_result(&rule)
             }
-            Err(e) => error_result(&format!("Failed to create rule: {e}")),
+            Err(e) => {
+                error!(error = %e, event_type = %event_type, "Failed to create notification rule");
+                error_result(&format!("Failed to create rule: {e}"))
+            }
         }
     }
 
     async fn handle_list_rules(&self, args: &serde_json::Value) -> CallToolResult {
-        let event_type = get_str(args, "event_type");
+        let event_type = match optional_str_trimmed(args, "event_type") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Some(ref et) = event_type {
+            if let Err(e) = validate_enum(et, VALID_EVENT_TYPES, "event_type") {
+                return e;
+            }
+        }
         let active = get_bool(args, "active");
+        let (limit, offset) = pagination(args);
 
         let mut sql = String::from(
             "SELECT id, event_type, condition, channel, template, active, created_at \
@@ -415,9 +567,12 @@ impl NotificationsMcpServer {
             param_idx += 1;
             bool_param = Some(a);
         }
-        let _ = param_idx;
 
-        sql.push_str(" ORDER BY created_at DESC");
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1
+        ));
 
         let mut query = sqlx::query_as::<_, Rule>(&sql);
         for p in &str_params {
@@ -426,10 +581,15 @@ impl NotificationsMcpServer {
         if let Some(a) = bool_param {
             query = query.bind(a);
         }
+        query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
             Ok(rules) => json_result(&rules),
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to list rules");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -441,18 +601,24 @@ impl NotificationsMcpServer {
         {
             Ok(r) => {
                 if r.rows_affected() > 0 {
-                    info!(id = id, "Deleted notification rule");
+                    info!(id = %id, "Deleted notification rule");
                     json_result(&serde_json::json!({ "deleted": true, "id": id }))
                 } else {
                     error_result(&format!("Rule '{id}' not found"))
                 }
             }
-            Err(e) => error_result(&format!("Failed to delete rule: {e}")),
+            Err(e) => {
+                error!(error = %e, id = %id, "Failed to delete rule");
+                error_result(&format!("Failed to delete rule: {e}"))
+            }
         }
     }
 
     async fn handle_notification_stats(&self, args: &serde_json::Value) -> CallToolResult {
-        let recipient = get_str(args, "recipient");
+        let recipient = match optional_str_trimmed(args, "recipient") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
         let where_clause = if recipient.is_some() {
             " WHERE recipient = $1"
@@ -472,7 +638,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch total_unread stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         // Unread by channel
@@ -484,7 +656,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch unread_email stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         let unread_slack: i64 = {
@@ -495,7 +673,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch unread_slack stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         let unread_in_app: i64 = {
@@ -506,7 +690,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch unread_in_app stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         // Delivery rates
@@ -523,7 +713,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch total_delivered stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         let total_count: i64 = {
@@ -532,7 +728,13 @@ impl NotificationsMcpServer {
             if let Some(ref r) = recipient {
                 q = q.bind(r);
             }
-            q.fetch_one(self.db.pool()).await.map(|r| r.0).unwrap_or(0)
+            match q.fetch_one(self.db.pool()).await {
+                Ok(row) => row.0,
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch total_count stats");
+                    return error_result(&format!("Database error fetching stats: {e}"));
+                }
+            }
         };
 
         let total_undelivered = total_count - total_delivered;
@@ -598,19 +800,19 @@ impl ServerHandler for NotificationsMcpServer {
             let result = match name_str {
                 "send_notification" => self.handle_send_notification(&args).await,
                 "list_notifications" => self.handle_list_notifications(&args).await,
-                "mark_read" => match get_str(&args, "id") {
-                    Some(id) => self.handle_mark_read(&id).await,
-                    None => error_result("Missing required parameter: id"),
+                "mark_read" => match require_str_trimmed(&args, "id") {
+                    Ok(id) => self.handle_mark_read(&id).await,
+                    Err(e) => e,
                 },
-                "mark_all_read" => match get_str(&args, "recipient") {
-                    Some(r) => self.handle_mark_all_read(&r).await,
-                    None => error_result("Missing required parameter: recipient"),
+                "mark_all_read" => match require_str_trimmed(&args, "recipient") {
+                    Ok(r) => self.handle_mark_all_read(&r).await,
+                    Err(e) => e,
                 },
                 "create_rule" => self.handle_create_rule(&args).await,
                 "list_rules" => self.handle_list_rules(&args).await,
-                "delete_rule" => match get_str(&args, "id") {
-                    Some(id) => self.handle_delete_rule(&id).await,
-                    None => error_result("Missing required parameter: id"),
+                "delete_rule" => match require_str_trimmed(&args, "id") {
+                    Ok(id) => self.handle_delete_rule(&id).await,
+                    Err(e) => e,
                 },
                 "notification_stats" => self.handle_notification_stats(&args).await,
                 _ => error_result(&format!("Unknown tool: {}", request.name)),
