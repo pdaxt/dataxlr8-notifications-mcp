@@ -6,6 +6,10 @@ description = "Notification management MCP server for DataXLR8 platform"
 license = "MIT"
 repository = "https://github.com/pdaxt/dataxlr8-notifications-mcp"
 
+
+[lib]
+name = "dataxlr8_notifications_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
